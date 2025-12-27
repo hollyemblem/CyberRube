@@ -12,6 +12,7 @@ from switchbot_direction_controller import SwitchBotAuth, SwitchBotClient, Direc
 from dotenv import load_dotenv
 from pathlib import Path
 from langtrace_python_sdk import langtrace
+import re
 
 
 #Load langtrace and logger details
@@ -37,6 +38,12 @@ def get_latest_image(folder_name):
     list_of_files = glob.glob(folder_name) 
     latest_file = max(list_of_files, key=os.path.getctime)
     return latest_file
+
+
+def extract_direction(text):
+    # Look for whole words matching allowed directions
+    match = re.search(r"\b(UP|LEFT|RIGHT)\b", text, flags=re.IGNORECASE)
+    return match.group(1).upper() if match else None
 
 def directions_executor(direction):
     auth = SwitchBotAuth.from_env()
@@ -224,6 +231,7 @@ def main():
             direction = direction_reasoning.split(':')[0]
             reasoning = direction_reasoning.split(':')[1]
             logger.info(direction_reasoning)
+            direction = extract_direction(direction)
             directions_executor(direction)
 
 
