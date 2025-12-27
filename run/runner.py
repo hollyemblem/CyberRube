@@ -11,13 +11,16 @@ import logging
 from switchbot_direction_controller import SwitchBotAuth, SwitchBotClient, DirectionSwitchController
 from dotenv import load_dotenv
 from pathlib import Path
+from langtrace_python_sdk import langtrace
 
+
+#Load langtrace and logger details
 load_dotenv(dotenv_path=Path(__file__).with_name(".env"))
+langtrace.init(api_key = os.getenv("LANGTRACE_API_KEY"))
 logger = logging.getLogger(__name__)
 logging.basicConfig(filename=os.getenv("LOGGER_NAME"), encoding='utf-8', level=logging.DEBUG, format='%(levelname)s:%(message)s')
 
 # ------------ CONFIG ------------
-
 SAVE_INTERVAL = 10             # seconds between minimap saves
 CAPTURE_DIR = os.getenv('CAPTURE_DIRECTORY')
 os.makedirs(CAPTURE_DIR, exist_ok=True)
@@ -152,7 +155,7 @@ def main():
     print("  1. Point laptop so the whole TV is visible.")
     print("  2. In the 'Webcam' window, LEFT-CLICK and drag a box around the minimap or the entire TV screen once.")
     print("  3. After releasing the mouse, the minimap ROI is locked.")
-    print("  4. Script will crop that region each frame, save every",
+    print("  4. Script will crop that region each frame, save every X seconds",
           SAVE_INTERVAL, "seconds to", CAPTURE_DIR, "and run the direction stub.")
     print("  5. Press 'q' to quit.")
 
@@ -182,6 +185,8 @@ def main():
             y2_c = max(0, min(h,     y2))
 
             minimap = frame[y1_c:y2_c, x1_c:x2_c]
+
+    
             cv2.rectangle(frame, (x1_c, y1_c), (x2_c, y2_c),
                           (0, 0, 255), 2)
             blur = cv2.GaussianBlur(minimap, (0, 0), sigmaX=1.2)
@@ -213,7 +218,7 @@ def main():
 
 
             # Direction stub
-            #direction = call_llm(CAPTURE_DIR,'gemini-2.5-flash',os.getenv("GEMINI_TOKEN", ""))
+            #direction = call_llm(CAPTURE_DIR,'gemini-2.5-flash',os.getenv("GEMINI_TOKEN"), os.getenv("OPEN_AI_PROMPT"))
             direction = call_llm(CAPTURE_DIR,'gpt-5-nano',os.getenv("OPEN_AI_TOKEN"), os.getenv("OPEN_AI_PROMPT"))
             direction_reasoning = (direction)
             direction = direction_reasoning.split(':')[0]
