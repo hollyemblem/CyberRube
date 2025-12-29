@@ -3,47 +3,56 @@ import numpy as np
 import time
 import glob
 import os
-from google import genai
-from google.genai import types
 import base64
-from openai import OpenAI
 import logging
+import re
+
 from switchbot_direction_controller import SwitchBotAuth, SwitchBotClient, DirectionSwitchController
 from dotenv import load_dotenv
 from pathlib import Path
-from langtrace_python_sdk import langtrace
-import re
+from langtrace_python_sdk import langtrace, inject_additional_attributes
+from opentelemetry import trace
 
+from openai import OpenAI
+from google import genai
+from google.genai import types
+import anthropic              # Claude
+from groq import Groq         # Llama via Groq
 
-#Load langtrace and logger details
+# ------------ CONFIG & SETUP ------------
 load_dotenv(dotenv_path=Path(__file__).with_name(".env"))
-langtrace.init(api_key = os.getenv("LANGTRACE_API_KEY"))
-logger = logging.getLogger(__name__)
-logging.basicConfig(filename=os.getenv("LOGGER_NAME"), encoding='utf-8', level=logging.DEBUG, format='%(levelname)s:%(message)s')
+langtrace.init(api_key=os.getenv("LANGTRACE_API_KEY"), write_spans_to_console=False)
 
-# ------------ CONFIG ------------
-SAVE_INTERVAL = 10             # seconds between minimap saves
-CAPTURE_DIR = os.getenv('CAPTURE_DIRECTORY')
+logger = logging.getLogger(__name__)
+logging.basicConfig(
+    filename=os.getenv("LOGGER_NAME"),
+    encoding="utf-8",
+    level=logging.DEBUG,
+    format="%(levelname)s:%(message)s",
+)
+
+SAVE_INTERVAL = 10
+CAPTURE_DIR = os.getenv("CAPTURE_DIRECTORY")
 os.makedirs(CAPTURE_DIR, exist_ok=True)
 
-# Global state for minimap ROI (in webcam coordinates)
-mm_roi = None             # (x1, y1, x2, y2)
+# minimap ROI (webcam coordinates)
+mm_roi = None
 dragging = False
 drag_start = None
 drag_end = None
 last_save_time = 0.0
 
+# -----------------------------------------------------------
+#                     HELPER FUNCTIONS
+# -----------------------------------------------------------
 
 def get_latest_image(folder_name):
-    list_of_files = glob.glob(folder_name) 
-    latest_file = max(list_of_files, key=os.path.getctime)
-    return latest_file
-
+    files = glob.glob(folder_name)
+    return max(files, key=os.path.getctime)
 
 def extract_direction(text):
-    # Look for whole words matching allowed directions
-    match = re.search(r"\b(UP|LEFT|RIGHT)\b", text, flags=re.IGNORECASE)
-    return match.group(1).upper() if match else None
+    m = re.search(r"\b(UP|LEFT|RIGHT)\b", text, flags=re.IGNORECASE)
+    return m.group(1).upper() if m else None
 
 def directions_executor(direction):
     auth = SwitchBotAuth.from_env()
@@ -52,212 +61,215 @@ def directions_executor(direction):
     controller.trigger(direction)
 
 
+# -----------------------------------------------------------
+#                     LLM DISPATCHER
+# -----------------------------------------------------------
 
 def call_llm(folder_name, llm_value, token, prompt):
-    # Load latest image
+    """
+    folder_name: directory containing images; e.g. CAPTURE_DIR
+    llm_value:   "gemini-2.5-flash" / "gpt-5-nano" / "claude-sonnet-4-5" / "llama-4-scout"
+    token:       API key
+    prompt:      navigation prompt expecting "DIRECTION:REASONING"
+    """
+    # --- load latest minimap image ---
     image_path = get_latest_image(f"{folder_name}*")
     with open(image_path, "rb") as f:
         image_bytes = f.read()
 
-    # -------------------------
-    # Gemini 2.5 Flash
-    # -------------------------
+    image_b64 = base64.b64encode(image_bytes).decode("utf-8")
+    PNG_MIME = "image/png"  # always PNG
+
+    ##OpenTelemetryEvent to pass custom attributes
+    tracer = trace.get_tracer("llm_agent_run")
+    with tracer.start_as_current_span(llm_value) as span:
+        #set attributes AFTER the span object exists
+        span.set_attribute("ctx.run_id", "1")
+        span.set_attribute("ctx.decision_source", "responses-test")
+
+    # ------------------------- Gemini -------------------------
     if llm_value == "gemini-2.5-flash":
         client = genai.Client(api_key=token)
-
-        response = client.models.generate_content(
+        resp = client.models.generate_content(
             model="gemini-2.5-flash",
             contents=[
-                types.Part.from_bytes(
-                    data=image_bytes,
-                    mime_type="image/jpeg",
-                ),
+                types.Part.from_bytes(data=image_bytes, mime_type=PNG_MIME),
                 prompt,
             ],
         )
+        span.set_attribute("ctx.next_action", resp.text.strip())
+        return resp.text.strip()
 
-        return response.text.strip()
-
-    # -------------------------
-    # OpenAI GPT-5-nano (Vision)
-    # -------------------------
+    # ------------------------- GPT-5 Nano Vision -------------------------
     elif llm_value == "gpt-5-nano":
-        print(prompt)
         client = OpenAI(api_key=token)
-
-        image_b64 = base64.b64encode(image_bytes).decode("utf-8")
-        data_url = f"data:image/png;base64,{image_b64}"
-
-        response = client.responses.create(
+        data_url = f"data:{PNG_MIME};base64,{image_b64}"
+        resp = client.responses.create(
             model="gpt-5-nano",
-            input=[
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "input_text", "text": prompt},
-                        {"type": "input_image", "image_url": data_url},
-                    ],
-                }
-            ],
+            input=[{
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": prompt},
+                    {"type": "input_image", "image_url": data_url},
+                ],
+            }],
         )
-        print(response.output_text)
-        return response.output_text
+        span.set_attribute("ctx.next_action", resp.output_text)
+        return resp.output_text
+
+    # ------------------------- Claude -------------------------
+    elif llm_value == "claude-sonnet-4-5":
+        client = anthropic.Anthropic(api_key=token)
+        resp = client.messages.create(
+            model="claude-sonnet-4-5",
+            max_tokens=1024,
+            messages=[{
+                "role": "user",
+                "content": [
+                    {"type": "image",
+                     "source": {"type": "base64", "media_type": PNG_MIME, "data": image_b64}},
+                    {"type": "text", "text": prompt},
+                ],
+            }],
+        )
+        text_blocks = [b.text for b in resp.content if b.type == "text"]
+        span.set_attribute("ctx.next_action", "".join(text_blocks).strip())
+        return "".join(text_blocks).strip()
+
+    # ------------------------- Llama -------------------------
+    elif llm_value == "llama-4-scout":
+        client = Groq(api_key=token)
+        data_url = f"data:{PNG_MIME};base64,{image_b64}"
+        out = client.chat.completions.create(
+            model="meta-llama/llama-4-scout-17b-16e-instruct",
+            messages=[{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    {"type": "image_url", "image_url": {"url": data_url}},
+                ],
+            }],
+            max_completion_tokens=1024,
+            stream=False,
+        )
+        span.set_attribute("ctx.next_action", out.choices[0].message.content.strip())
+        return out.choices[0].message.content.strip()
 
     else:
         raise ValueError(f"Unsupported llm_value: {llm_value}")
-    
 
-# ------------ MOUSE CALLBACK ------------
 
-def webcam_mouse_cb(event, x, y,  flags, param):
-    """
-    Mouse callback for the Webcam window:
-    left-click and drag a rectangle around the minimap  or the TV ONCE.
-    """
+# -----------------------------------------------------------
+#                     MOUSE CALLBACK
+# -----------------------------------------------------------
+
+def webcam_mouse_cb(event, x, y, flags, param):
     global dragging, drag_start, drag_end, mm_roi
-
     if event == cv2.EVENT_LBUTTONDOWN:
-        dragging = True
-        drag_start = (x, y)
-        drag_end = (x, y)
-
+        dragging = True; drag_start = (x, y); drag_end = (x, y)
     elif event == cv2.EVENT_MOUSEMOVE and dragging:
         drag_end = (x, y)
-
     elif event == cv2.EVENT_LBUTTONUP:
-        dragging = False
-        drag_end = (x, y)
-
-        x1, y1 = drag_start
-        x2, y2 = drag_end
-        x1, x2 = sorted([x1, x2])
-        y1, y2 = sorted([y1, y2])
-
+        dragging = False; drag_end = (x, y)
+        (x1, y1), (x2, y2) = sorted([drag_start, drag_end])
         mm_roi = (x1, y1, x2, y2)
-
-        print("[MM] Minimap or TV ROI set (webcam pixels):", mm_roi)
-        print("[MM] You can now let it run; it will crop & save from this region.")
+        print("[MM] ROI set:", mm_roi)
 
 
-# ------------ MAIN LOOP ------------
+# -----------------------------------------------------------
+#                        MAIN LOOP
+# -----------------------------------------------------------
 
 def main():
     global mm_roi, dragging, drag_start, drag_end, last_save_time
 
     cap = cv2.VideoCapture(0, cv2.CAP_AVFOUNDATION)
-
- # Try to force higher capture resolution:
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH,  1920)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
     cap.set(cv2.CAP_PROP_FPS, 30)
-    if not cap.isOpened():
-        cap = cv2.VideoCapture(0)
-    if not cap.isOpened():
-        raise RuntimeError("Could not open webcam.")
+    if not cap.isOpened(): cap = cv2.VideoCapture(0)
+    if not cap.isOpened(): raise RuntimeError("Could not open webcam.")
 
     cv2.namedWindow("Webcam")
     cv2.setMouseCallback("Webcam", webcam_mouse_cb)
 
-    print("Instructions:")
-    print("  1. Point laptop so the whole TV is visible.")
-    print("  2. In the 'Webcam' window, LEFT-CLICK and drag a box around the minimap or the entire TV screen once.")
-    print("  3. After releasing the mouse, the minimap ROI is locked.")
-    print("  4. Script will crop that region each frame, save every X seconds",
-          SAVE_INTERVAL, "seconds to", CAPTURE_DIR, "and run the direction stub.")
-    print("  5. Press 'q' to quit.")
-
     while True:
         ret, frame = cap.read()
         if not ret:
-            print("No frame from camera; exiting.")
-            break
+            print("No frame; exiting."); break
 
-        # Draw current drag rectangle, if dragging
         if dragging and drag_start and drag_end:
-            x1, y1 = drag_start
-            x2, y2 = drag_end
-            cv2.rectangle(frame, (x1, y1), (x2, y2),
-                          (0, 255, 255), 2)
+            cv2.rectangle(frame, drag_start, drag_end, (0,255,255), 2)
 
-        minimap = None
+        # ---- after ROI selected ----
+        if mm_roi:
+            x1,y1,x2,y2 = mm_roi
+            h,w = frame.shape[:2]
+            x1,x2 = max(0,x1), min(w,x2)
+            y1,y2 = max(0,y1), min(h,y2)
+            crop = frame[y1:y2, x1:x2]
 
-        if mm_roi is not None:
-            x1, y1, x2, y2 = mm_roi
+            blur = cv2.GaussianBlur(crop,(0,0),1.2)
+            sharp = cv2.addWeighted(crop,1.6,blur,-0.6,0)
 
-            # clamp to frame size
-            h, w = frame.shape[:2]
-            x1_c = max(0, min(w - 1, x1))
-            x2_c = max(0, min(w,     x2))
-            y1_c = max(0, min(h - 1, y1))
-            y2_c = max(0, min(h,     y2))
-
-            minimap = frame[y1_c:y2_c, x1_c:x2_c]
-
-    
-            cv2.rectangle(frame, (x1_c, y1_c), (x2_c, y2_c),
-                          (0, 0, 255), 2)
-            blur = cv2.GaussianBlur(minimap, (0, 0), sigmaX=1.2)
-            sharpened = cv2.addWeighted(minimap, 1.6, blur, -0.6, 0)
-
-            '''# --- Denoise ---
-                den = cv2.fastNlMeansDenoisingColored(minimap, None, 10, 10, 7, 21)
-
-                # --- Upscale ---
-                up = cv2.resize(den, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_CUBIC)
-
-                # --- Sharpen ---
-                blur = cv2.GaussianBlur(up, (0, 0), sigmaX=1.4)
-                sharp = cv2.addWeighted(up, 1.7, blur, -0.7, 0)
-
-                # Use this as your final minimap
-                final_minimap = sharp
-            '''
-
-            # Save minimap every SAVE_INTERVAL seconds
-            now = time.time()
-            if now - last_save_time >= SAVE_INTERVAL:
+            # save PNG every interval
+            if time.time() - last_save_time >= SAVE_INTERVAL:
                 ts = time.strftime("%Y%m%d_%H%M%S")
-                out_path = os.path.join(CAPTURE_DIR,
-                                        f"minimap_{ts}.png")
-                cv2.imwrite(out_path, sharpened)
-                print(f"[SAVE] {out_path}")
-                last_save_time = now
+                out = os.path.join(CAPTURE_DIR, f"minimap_{ts}.png")
+                cv2.imwrite(out, sharp)
+                last_save_time = time.time()
+                print("[SAVE]", out)
 
+            # ---- LLM SELECTION (change here to swap models) ----
+            #direction_text = call_llm(
+                    #CAPTURE_DIR,
+                    # "gpt-5-nano", os.getenv("OPEN_AI_TOKEN"), os.getenv("OPEN_AI_PROMPT")
+                    # "gemini-2.5-flash", os.getenv("GEMINI_TOKEN"), os.getenv("OPEN_AI_PROMPT")
+                    # "claude-sonnet-4-5", os.getenv("CLAUDE_API_KEY"), os.getenv("CLAUDE_PROMPT")
+                   # "llama-4-scout", os.getenv("GROQ_API_KEY"), os.getenv("LLAMA_PROMPT")
+                #)
+            LLM_ROTATION = [
+                ("gpt-5-nano",       os.getenv("OPEN_AI_TOKEN"),   os.getenv("OPEN_AI_PROMPT"))
+                #,
+               # ("claude-sonnet-4-5",os.getenv("CLAUDE_API_KEY"),  os.getenv("CLAUDE_PROMPT")),
+                #("llama-4-scout",    os.getenv("GROQ_API_KEY"),    os.getenv("LLAMA_PROMPT")),
+            ]
 
-            # Direction stub
-            #direction = call_llm(CAPTURE_DIR,'gemini-2.5-flash',os.getenv("GEMINI_TOKEN"), os.getenv("OPEN_AI_PROMPT"))
-            direction = call_llm(CAPTURE_DIR,'gpt-5-nano',os.getenv("OPEN_AI_TOKEN"), os.getenv("OPEN_AI_PROMPT"))
-            direction_reasoning = (direction)
-            direction = direction_reasoning.split(':')[0]
-            reasoning = direction_reasoning.split(':')[1]
-            logger.info(direction_reasoning)
-            direction = extract_direction(direction)
-            directions_executor(direction)
+            for llm_name, key, prompt in LLM_ROTATION:
+                print(f"\n🔍 Testing: {llm_name}")
+                direction_text = call_llm(CAPTURE_DIR, llm_name, key, prompt)
 
+                # Parse response
+                parts = direction_text.split(":", 1)
+                direction_raw = parts[0] if parts else ""
+                reasoning = parts[1] if len(parts)>1 else ""
 
-            cv2.putText(frame, f"Dir: {direction}",
-                        (10, 40), cv2.FONT_HERSHEY_SIMPLEX,
-                        1.2, (255, 255, 255), 2, cv2.LINE_AA)
+                direction = extract_direction(direction_raw) or "UNKNOWN"
+                logger.info(f"{llm_name} → {direction_text}")
 
+                print(f"🧭 {llm_name} → Direction: {direction}")
+                print(f"💡 Reasoning: {reasoning}")
+            '''
+            # Parse "DIRECTION:REASONING"
+            parts = direction_text.split(":",1)
+            direction_raw = parts[0] if parts else ""
+            reasoning = parts[1] if len(parts)>1 else ""
+            direction = extract_direction(direction_raw)
+           #if direction: directions_executor(direction)
+           '''
 
-            # Show minimap in its own window too
-            cv2.imshow("Minimap", sharpened)
+            logger.info(direction_text)
+            cv2.putText(frame, f"Dir: {direction or 'UNKNOWN'}",(10,40),
+                        cv2.FONT_HERSHEY_SIMPLEX,1.2,(255,255,255),2)
 
-        # Show main webcam view
-        if mm_roi is None:
-            cv2.putText(frame, "Drag a box around the minimap or TV",
-                        (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
-                        (0, 255, 255), 2)
+            cv2.imshow("Minimap", sharp)
+
+        else:
+            cv2.putText(frame,"Drag ROI around minimap or TV",(20,40),
+                        cv2.FONT_HERSHEY_SIMPLEX,0.7,(0,255,255),2)
 
         cv2.imshow("Webcam", frame)
-
-        key = cv2.waitKey(1)
-        if key != -1:
-            key = key & 0xFF
-            if key == ord('q'):
-                print("Exiting...")
-                break
-
+        if cv2.waitKey(1) & 0xFF == ord("q"): break
 
     cap.release()
     cv2.destroyAllWindows()
